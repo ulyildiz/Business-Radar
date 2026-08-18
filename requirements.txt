@@ -1,0 +1,5 @@
+# leadgen calisma bagimliliklari
+#
+# Proje kasitli olarak TEK bagimlilik kullanir. `.env` okuma stdlib ile
+# yapilir (config.py) — python-dotenv gibi ek paket EKLENMEZ.
+requests>=2.31.0

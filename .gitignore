@@ -1,0 +1,18 @@
+# GERCEK API anahtarlari — asla commit edilmez
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Uretilen cikti dosyalari
+*_no_website.csv
+*_has_website.csv
+*_NOTLAR.txt
+
+# Makefile tarafindan uretilir
+requirements.lock.txt
+.install-stamp
