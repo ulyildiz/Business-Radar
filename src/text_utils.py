@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Isim normalizasyonu ve web sitesi/alan adi siniflandirmasi.
+"""Name normalization and website/domain classification.
 
-Tek sorumluluk: metin. Ag istegi yok, dosya yazmaz, ust seviye modul
-import etmez — pipeline'in her katmani bunu kullanabilsin diye en altta durur.
+Single responsibility: text. No network calls, no file writes, no imports of
+higher-level modules — it sits at the bottom so every pipeline layer can use it.
+
+NOTE ON LANGUAGE
+The user interface is English, but the word lists below are DATA, not UI text.
+They encode how business names and domains look in the target market (Turkish),
+and translating them would break matching. Keep them in the source language.
 """
 
 from __future__ import annotations
@@ -13,23 +18,25 @@ import unicodedata
 from typing import List
 
 # ---------------------------------------------------------------------------
-# Turkce duyarli normalizasyon
+# Locale-aware normalization
 # ---------------------------------------------------------------------------
 
+# Turkish letters have no ASCII equivalent under NFKD (dotless i in particular),
+# so they are folded explicitly before the generic accent stripping below.
 _TR_MAP = str.maketrans({
     "ı": "i", "İ": "i", "I": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
     "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
     "â": "a", "î": "i", "û": "u", "Â": "a", "Î": "i", "Û": "u",
 })
 
-# Isim karsilastirmasinda anlam tasimayan kelimeler
+# Words that carry no meaning when comparing business names.
 _STOPWORDS = {
     "ve", "the", "and", "de", "da", "ltd", "sti", "as", "a", "s",
     "sirketi", "san", "tic", "limited", "anonim", "ltdsti",
 }
 
-# Sektor jenerigi kelimeler: alan adi eslemesinde AYIRT EDICI SAYILMAZ.
-# "kebapci.com" -> "Ali Usta Kebap" isletmesinin sitesi degildir.
+# Generic trade words: NOT treated as distinctive when matching a domain.
+# "kebapci.com" is not the website of a business called "Ali Usta Kebap".
 GENERIC_BIZ_WORDS = {
     "kebap", "kebab", "kebapci", "restoran", "restaurant", "lokanta", "cafe",
     "kafe", "kahve", "pide", "pizza", "burger", "doner", "cig", "kofte",
@@ -52,21 +59,21 @@ GENERIC_BIZ_WORDS = {
     "usta", "atolye", "dukkan", "shop", "store", "online", "web", "site",
 }
 
-# Bu alan adlari "isletmenin kendi web sitesi" SAYILMAZ.
-# Sadece Instagram sayfasi olan bir isletme bir web ajansi icin hala lead'dir.
+# These domains do NOT count as "the business has its own website".
+# A business with only an Instagram page is still a lead for a web agency.
 NON_WEBSITE_DOMAINS = {
-    # sosyal
+    # social
     "facebook.com", "fb.com", "fb.me", "instagram.com", "instagr.am",
     "twitter.com", "x.com", "linkedin.com", "youtube.com", "youtu.be",
     "tiktok.com", "pinterest.com", "wa.me", "whatsapp.com", "t.me",
     "telegram.me", "snapchat.com", "threads.net", "vk.com",
-    # harita / dizin
+    # maps / directories
     "google.com", "goo.gl", "g.page", "openstreetmap.org", "tomtom.com",
     "here.com", "bing.com", "yandex.com", "yandex.com.tr", "waze.com",
     "apple.com", "foursquare.com", "swarmapp.com", "4sq.com",
     "yelp.com", "tripadvisor.com", "zomato.com",
     "wikipedia.org", "wikidata.org", "wikimapia.org",
-    # TR pazaryeri / dizin / rezervasyon
+    # marketplaces / directories / booking
     "yemeksepeti.com", "getir.com", "trendyol.com", "trendyolyemek.com",
     "migros.com.tr", "hepsiburada.com", "n11.com", "gittigidiyor.com",
     "sahibinden.com", "hurriyetemlak.com", "emlakjet.com", "zingat.com",
@@ -79,14 +86,14 @@ NON_WEBSITE_DOMAINS = {
     "yellowpages.com", "yellowpages.com.tr",
     "opentable.com", "quandoo.com.tr", "treatwell.com.tr",
     "linktr.ee", "beacons.ai", "bio.link", "carrd.co",
-    # ucretsiz barindirma / blog (ajans acisindan hala hedef)
+    # free hosting / blogs (still a prospect from an agency's point of view)
     "blogspot.com", "wordpress.com", "wixsite.com", "weebly.com",
     "webnode.com.tr", "tr.gg", "blogcu.com", "sitey.me",
 }
 
 
 def norm_text(s: str) -> str:
-    """Turkce duyarli normalizasyon: kucuk harf, aksansiz, sadece harf/rakam."""
+    """Locale-aware normalization: lowercase, accent-free, alphanumeric only."""
     if not s:
         return ""
     s = s.translate(_TR_MAP)
@@ -98,29 +105,29 @@ def norm_text(s: str) -> str:
 
 
 def name_tokens(s: str) -> List[str]:
-    """Isimdeki anlamli kelimeler (stopword'ler ayiklanmis)."""
+    """Meaningful words in a business name, with stopwords removed."""
     return [t for t in norm_text(s).split() if t and t not in _STOPWORDS]
 
 
 def name_similarity(a: str, b: str) -> float:
-    """0..1 arasi isim benzerligi (token Jaccard + dizi benzerligi karisimi)."""
+    """Name similarity in 0..1 (token Jaccard blended with sequence ratio)."""
     ta, tb = set(name_tokens(a)), set(name_tokens(b))
     if not ta or not tb:
         return 0.0
     jacc = len(ta & tb) / len(ta | tb)
     seq = difflib.SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
-    # bir taraf digerinin alt kumesiyse ("Ali Usta" vs "Ali Usta Kebap") odullendir
+    # Reward one name being a subset of the other ("Ali Usta" vs "Ali Usta Kebap").
     if ta <= tb or tb <= ta:
         jacc = max(jacc, 0.85)
     return max(jacc, seq * 0.95)
 
 
 # ---------------------------------------------------------------------------
-# URL / alan adi
+# URL / domain
 # ---------------------------------------------------------------------------
 
 def url_host(url: str) -> str:
-    """URL'den host adi cikarir (sema olmadan da calisir)."""
+    """Extract the host from a URL (works without a scheme too)."""
     if not url:
         return ""
     u = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", url.strip())
@@ -131,7 +138,7 @@ def url_host(url: str) -> str:
 
 
 def registrable_domain(host: str) -> str:
-    """Kaba eTLD+1. co.uk / com.tr gibi ikili uzantilari kollar."""
+    """Approximate eTLD+1, handling two-part suffixes such as co.uk / com.tr."""
     parts = host.split(".")
     if len(parts) <= 2:
         return host
@@ -145,22 +152,23 @@ def registrable_domain(host: str) -> str:
 
 
 def is_real_website(url: str) -> bool:
-    """URL isletmenin KENDI sitesi mi, yoksa sosyal medya/dizin mi?"""
+    """Is this the business's OWN site, or just social media / a directory?"""
     host = url_host(url)
     if not host or "." not in host:
         return False
     if registrable_domain(host) in NON_WEBSITE_DOMAINS or host in NON_WEBSITE_DOMAINS:
         return False
-    # alt alan adiyla kacamak: business.facebook.com gibi
+    # Catch subdomain escapes such as business.facebook.com.
     return not any(host == d or host.endswith("." + d) for d in NON_WEBSITE_DOMAINS)
 
 
 def domain_matches_name(url: str, business_name: str, min_token_len: int = 3) -> bool:
-    """Alan adi gercekten bu isletmeye mi ait? (Katman 3'un eleme kaniti)
+    """Does this domain really belong to this business? (Layer 3 exclusion proof)
 
-    Bilerek TUTUCU: yanlis eleme = kaybedilmis lead, ve bu sessizce olur.
-    Tek bir jenerik kelimenin ("kebap", "kuafor") alan adinda gecmesi kanit
-    sayilmaz — yoksa "kebapci.com" yuzunden "Ali Usta Kebap" listeden duserdi.
+    Deliberately CONSERVATIVE: a false exclusion is a lost lead, and it happens
+    silently. A single generic word ("kebap", "kuafor") appearing in the domain
+    is not proof — otherwise "kebapci.com" would knock "Ali Usta Kebap" off the
+    list. A false keep only costs one wasted outreach call.
     """
     dom_core = norm_text(registrable_domain(url_host(url)).split(".")[0]).replace(" ", "")
     all_toks = name_tokens(business_name)
@@ -168,49 +176,23 @@ def domain_matches_name(url: str, business_name: str, min_token_len: int = 3) ->
     if not dom_core or not joined:
         return False
 
-    # 1) Tam eslesme: "Ali Usta Kebap" -> aliustakebap.com
+    # 1) Exact match: "Ali Usta Kebap" -> aliustakebap.com
     if joined == dom_core:
         return True
 
-    # 2) Cok kisa alan adlari kanit sayilmaz (ada.com, abc.com ...)
+    # 2) Very short domains are not proof (ada.com, abc.com, ...).
     if len(dom_core) < 5:
         return False
 
-    # 3) Isletmenin AYIRT EDICI kismi alan adinda gecmeli.
-    #    "Ozkan Oto Servis" icin bu "ozkan"dir; otoservis.com onun sitesi degil.
+    # 3) The DISTINCTIVE part of the name must appear in the domain.
+    #    For "Ozkan Oto Servis" that is "ozkan"; otoservis.com is not its site.
     distinctive = [t for t in all_toks if len(t) >= min_token_len and t not in GENERIC_BIZ_WORDS]
     if not distinctive:
-        return False  # tamamen jenerik isim -> sadece tam eslesme kabul (madde 1)
+        return False  # fully generic name -> only an exact match counts (rule 1)
     if not any(t in dom_core for t in distinctive):
         return False
 
-    # 4) Alan adinin buyuk kismi isletme adindan gelmeli.
-    #    "ali" -> alibaba.com sadece %43 kapsar, kanit sayilmaz.
+    # 4) Most of the domain must come from the business name.
+    #    "ali" covers only 43% of alibaba.com, which is not proof.
     covered = sum(len(t) for t in all_toks if t in dom_core)
     return (covered / len(dom_core)) >= 0.6
-
-
-def tr_locative(n: int) -> str:
-    """Sayiya Turkce bulunma hali eki ekler: 3 -> 3'unde, 6 -> 6'sinda.
-
-    Ek, sayinin okunusundaki son kelimeye gore degisir ("dort" -> 4'unde,
-    "alti" -> 6'sinda). Duz bir "'sinde" eki cogu sayida yanlis olurdu.
-    """
-    if n == 0:
-        return "0'ında"
-    table = {
-        1: "inde", 2: "sinde", 3: "ünde", 4: "ünde", 5: "inde",
-        6: "sında", 7: "sinde", 8: "inde", 9: "unda",
-        10: "unda", 20: "sinde", 30: "unda", 40: "ında", 50: "sinde",
-        60: "ında", 70: "inde", 80: "inde", 90: "ında",
-        100: "ünde", 1000: "inde",
-    }
-    if n % 10:
-        key = n % 10
-    elif n % 100:
-        key = n % 100
-    elif n % 1000:
-        key = 100
-    else:
-        key = 1000
-    return f"{n}'{table[key]}"

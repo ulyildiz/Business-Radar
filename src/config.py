@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Ayarlarin tek kaynagi: .env okuma + CLI override birlestirme.
+"""Single source of settings: .env loading merged with CLI overrides.
 
-Tek sorumluluk: konfigurasyon. Bu modul API cagirmaz, dosya YAZMAZ,
-sadece okur ve dogrular.
+Single responsibility: configuration. This module makes no API calls and
+WRITES no files — it only reads and validates.
 
-Oncelik sirasi:  CLI argumani  >  .env dosyasi  >  ortam degiskeni  >  varsayilan
+Precedence:  CLI argument  >  .env file  >  environment variable  >  default
 """
 
 from __future__ import annotations
@@ -13,14 +13,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-VERSION = "2.0.0"
+APP_NAME = "businessfind"
+VERSION = "2.1.0"
 
-# .env icinde beklenen degisken adlari (.env.example ile birebir ayni olmali)
+# Variable names expected in .env (must match .env.example exactly).
 ENV_CONTACT = "CONTACT_EMAIL"
 ENV_TOMTOM = "TOMTOM_API_KEY"
 ENV_LANGSEARCH = "LANGSEARCH_API_KEY"
 
-USER_AGENT_TMPL = "leadgen/{ver} (local business lead finder; contact: {contact})"
+USER_AGENT_TMPL = APP_NAME + "/{ver} (local business lead finder; contact: {contact})"
 
 DEFAULT_OVERPASS_MIRRORS = [
     "https://overpass-api.de/api/interpreter",
@@ -28,32 +29,56 @@ DEFAULT_OVERPASS_MIRRORS = [
     "https://z.overpass-api.de/api/interpreter",
 ]
 
-# Rate limit varsayilanlari (saniye)
-DELAY_NOMINATIM = 1.1   # Nominatim kurali: en fazla 1 istek/saniye
+# Rate-limit defaults, in seconds.
+DELAY_NOMINATIM = 1.1   # Nominatim policy: at most 1 request per second
 DELAY_OVERPASS = 2.0
-DELAY_TOMTOM = 0.25     # freemium ~5 QPS
-DELAY_LANGSEARCH = 1.0
+DELAY_TOMTOM = 0.25     # freemium, roughly 5 QPS
+
+# LangSearch free tier: QPS=1, QPM=60, QPD=1000.
+# 1.0 sits exactly on the boundary; any clock skew or latency jitter trips the
+# limit immediately. 1.1 leaves a small but decisive margin. On a paid tier
+# (Tier 1: QPS=5) this can be lowered with --langsearch-delay 0.25.
+DELAY_LANGSEARCH = 1.1
+LANGSEARCH_FREE_QPD = 1000
+
+# THIS IS THE ACTUAL BINDING LIMIT.
+# A 1.1s interval satisfies QPS=1 but works out to ~55 requests per minute;
+# once retries are added it pins against the QPM=60 ceiling and 429s cluster.
+# Measured behaviour: 28 requests / 29s = 58 per minute -> at the ceiling.
+# We use 55 rather than 60 because the server's minute window does not start
+# at the same instant as ours; running exactly at the ceiling means constantly
+# scraping against it.
+LANGSEARCH_FREE_QPM = 60
+LANGSEARCH_PER_MINUTE = 55
+
+LANGSEARCH_QUOTA_FILE = ".langsearch_quota_state.json"
+# Layer 3 stops after this many consecutive CANDIDATE failures (FR-29).
+# A 429 is no longer treated as a permanent fault: adaptive slowdown is in
+# place, so the layer recovers on its own. Hence the high threshold — stopping
+# early used to cut a healthy scan short and leave leads as 'not_checked'.
+LANGSEARCH_MAX_CONSECUTIVE_FAILURES = 10
 
 TOMTOM_DAILY_FREE_LIMIT = 2500
-TOMTOM_MAX_LIMIT = 100          # tek cagrida maksimum sonuc (API siniri)
-TOMTOM_DEFAULT_CELL_M = 600     # discover modunda grid hucre yaricapi
+TOMTOM_MAX_LIMIT = 100          # maximum results per call (API limit)
+TOMTOM_DEFAULT_CELL_M = 600     # grid cell radius in discover mode
+TOMTOM_DEFAULT_LANGUAGE = "tr-TR"   # locale of returned business data
 
 
 class ConfigError(Exception):
-    """Ayar eksik/hatali — sessizce devam etmek yerine acik hata."""
+    """A setting is missing or invalid — fail loudly instead of continuing."""
 
 
 # ---------------------------------------------------------------------------
-# .env okuma (stdlib; python-dotenv gibi ek bagimlilik EKLENMEZ)
+# .env loading (stdlib only; no extra dependency such as python-dotenv)
 # ---------------------------------------------------------------------------
 
 def parse_env_text(text: str) -> Dict[str, str]:
-    """`KEY=value` satirlarini sozluge cevirir.
+    """Turn `KEY=value` lines into a dictionary.
 
-    - `#` ile baslayan satirlar yorum
-    - bos satirlar yok sayilir
-    - `export KEY=value` kabul edilir
-    - deger cift/tek tirnakla sarilmissa tirnaklar soyulur
+    - lines starting with `#` are comments
+    - blank lines are ignored
+    - `export KEY=value` is accepted
+    - surrounding single or double quotes are stripped from the value
     """
     out: Dict[str, str] = {}
     for raw in text.splitlines():
@@ -73,13 +98,13 @@ def parse_env_text(text: str) -> Dict[str, str]:
 
 
 def find_env_file(explicit: Optional[str] = None) -> Optional[str]:
-    """.env dosyasini bulur: once --env-file, sonra cwd, sonra paket koku."""
+    """Locate .env: --env-file first, then the cwd, then the project root."""
     if explicit:
         return explicit if os.path.isfile(explicit) else None
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(os.getcwd(), ".env"),
-        os.path.join(os.path.dirname(here), ".env"),  # lead-gen-tool/.env
+        os.path.join(os.path.dirname(here), ".env"),  # project root, next to src/
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -88,10 +113,11 @@ def find_env_file(explicit: Optional[str] = None) -> Optional[str]:
 
 
 def load_env(explicit: Optional[str] = None) -> Dict[str, str]:
-    """.env dosyasini okur; yoksa bos sozluk doner (hata FIRLATMAZ).
+    """Read .env; return an empty dict if absent (this does NOT raise).
 
-    Eksik dosyanin hataya donusmesi, hangi anahtarlarin GEREKLI oldugu
-    bilindikten sonra `Config.require_keys()` icinde yapilir.
+    Turning a missing file into an error happens later, in
+    `Config.require_keys()`, once we know which keys are actually REQUIRED for
+    this particular run.
     """
     path = find_env_file(explicit)
     if not path:
@@ -100,7 +126,7 @@ def load_env(explicit: Optional[str] = None) -> Dict[str, str]:
         with open(path, "r", encoding="utf-8") as fh:
             return parse_env_text(fh.read())
     except OSError as exc:
-        raise ConfigError(f".env okunamadi ({path}): {exc}") from exc
+        raise ConfigError(f"Could not read .env ({path}): {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -109,19 +135,19 @@ def load_env(explicit: Optional[str] = None) -> Dict[str, str]:
 
 @dataclass
 class Config:
-    """Tum calisma ayarlari tek nesnede."""
+    """Every runtime setting in a single object."""
 
-    # --- kimlik / anahtarlar ---
+    # --- identity / keys ---
     contact: str = ""
     tomtom_key: str = ""
     langsearch_key: str = ""
     env_path: Optional[str] = None
 
-    # --- arama alani ---
+    # --- search area ---
     radius_m: int = 2000
     include_unnamed: bool = False
 
-    # --- katman anahtarlari ---
+    # --- layer switches ---
     skip_tomtom: bool = False
     skip_langsearch: bool = False
     tomtom_mode: str = "discover"
@@ -137,17 +163,24 @@ class Config:
     tomtom_daily_limit: int = TOMTOM_DAILY_FREE_LIMIT
     tomtom_match_radius_m: int = 250
     tomtom_categories: Dict[str, str] = field(default_factory=dict)
+    # Locale of the DATA TomTom returns (business names, addresses) — not the
+    # UI language. Match it to the region being scanned so names come back the
+    # way they are actually written on the shopfront.
+    tomtom_language: str = TOMTOM_DEFAULT_LANGUAGE
 
     # --- LangSearch ---
     langsearch_count: int = 10
     langsearch_city: Optional[str] = None
+    langsearch_daily_limit: int = LANGSEARCH_FREE_QPD
+    langsearch_per_minute: int = LANGSEARCH_PER_MINUTE
+    langsearch_quota_file: str = LANGSEARCH_QUOTA_FILE
 
-    # --- eslestirme ---
+    # --- matching ---
     merge_distance_m: float = 75.0
     name_threshold: float = 0.72
     min_token_len: int = 3
 
-    # --- ag ---
+    # --- network ---
     delay_nominatim: float = DELAY_NOMINATIM
     delay_overpass: float = DELAY_OVERPASS
     delay_tomtom: float = DELAY_TOMTOM
@@ -155,7 +188,7 @@ class Config:
     max_retries: int = 3
     timeout_s: int = 60
 
-    # --- cikti ---
+    # --- output ---
     output_base: str = "leads"
     write_has_website: bool = True
     full_columns: bool = False
@@ -175,10 +208,10 @@ class Config:
     # -----------------------------------------------------------------------
 
     def require_keys(self) -> None:
-        """Gerekli anahtarlar var mi? Yoksa ACIK hatayla dur (FR-22).
+        """Are the required keys present? If not, stop with an EXPLICIT error.
 
-        "Gerekli", o calistirmada hangi katmanlarin acik oldugua gore degisir:
-        --skip-tomtom verilmisse TomTom anahtari aranmaz.
+        What counts as "required" depends on which layers are enabled for this
+        run: with --skip-tomtom, no TomTom key is expected.
         """
         missing: List[str] = []
         if not self.contact:
@@ -194,38 +227,39 @@ class Config:
 
 
 def _missing_keys_message(missing: Sequence[str], env_path: Optional[str]) -> str:
-    """Ne yapilacagini SOYLEYEN hata metni — sadece 'eksik' demek yetmez."""
-    lines = ["Eksik ayar: " + ", ".join(missing), ""]
+    """An error message that says what to DO — "missing" alone is not enough."""
+    lines = ["Missing configuration: " + ", ".join(missing), ""]
     if env_path:
-        lines.append(f".env bulundu ({env_path}) ama yukaridaki deger(ler) bos.")
-        lines.append("Dosyayi acip doldurun, ornegin:")
+        lines.append(f".env was found ({env_path}) but the value(s) above are empty.")
+        lines.append("Open the file and fill them in, for example:")
     else:
-        lines.append(".env dosyasi bulunamadi. Once ornegi kopyalayin:")
+        lines.append("No .env file was found. Copy the example first:")
         lines.append("")
         lines.append("    cp .env.example .env")
         lines.append("")
-        lines.append("Sonra dosyayi acip doldurun, ornegin:")
+        lines.append("Then open it and fill in the values, for example:")
     lines.append("")
     for key in missing:
         if key == ENV_CONTACT:
-            lines.append(f"    {key}=siz@ajansiniz.com")
+            lines.append(f"    {key}=you@your-agency.com")
         else:
-            lines.append(f"    {key}=<panelden aldiginiz anahtar>")
+            lines.append(f"    {key}=<key from the provider dashboard>")
     lines.append("")
     if ENV_CONTACT in missing:
-        lines.append(f"{ENV_CONTACT} zorunlu: Nominatim ve Overpass kullanim politikasi")
-        lines.append("iletisim bilgisi iceren aciklayici bir User-Agent sart kosuyor.")
+        lines.append(f"{ENV_CONTACT} is mandatory: the Nominatim and Overpass usage")
+        lines.append("policies require a descriptive User-Agent with contact details.")
     if ENV_TOMTOM in missing:
-        lines.append("TomTom katmanini kullanmayacaksaniz: --skip-tomtom")
+        lines.append("To run without the TomTom layer: --skip-tomtom")
     if ENV_LANGSEARCH in missing:
-        lines.append("LangSearch katmanini kullanmayacaksaniz: --skip-langsearch")
+        lines.append("To run without the LangSearch layer: --skip-langsearch")
     lines.append("")
-    lines.append("Anahtarlar CLI ile de verilebilir: --tomtom-key / --langsearch-key / --contact")
+    lines.append("Keys can also be passed on the command line: "
+                 "--tomtom-key / --langsearch-key / --contact")
     return "\n".join(lines)
 
 
 def resolve_secret(cli_value: Optional[str], env_file: Dict[str, str], key: str) -> str:
-    """CLI > .env dosyasi > ortam degiskeni sirasiyla bir ayari cozer."""
+    """Resolve one setting in order: CLI > .env file > environment variable."""
     if cli_value:
         return cli_value.strip()
     if env_file.get(key):

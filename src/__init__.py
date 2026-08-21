@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""leadgen — GPS yaricapinda web sitesi olan/olmayan yerel isletme bulucu."""
+"""businessfind — finds local businesses with and without websites in a GPS radius."""
 
 from .config import VERSION
 

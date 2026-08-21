@@ -1,4 +1,4 @@
-# GERCEK API anahtarlari — asla commit edilmez
+# REAL API keys - never committed
 .env
 
 # Python
@@ -8,11 +8,15 @@ __pycache__/
 .venv/
 venv/
 
-# Uretilen cikti dosyalari
+# Generated output files
 *_no_website.csv
 *_has_website.csv
+*_NOTES.txt
+# Legacy name used before the notes file was renamed; kept so old output
+# files already on disk do not suddenly show up as untracked.
 *_NOTLAR.txt
 
-# Makefile tarafindan uretilir
+# Produced by the Makefile
 requirements.lock.txt
 .install-stamp
+.langsearch_quota_state.json

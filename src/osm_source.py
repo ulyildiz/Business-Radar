@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""KATMAN 1a — OpenStreetMap / Overpass kesfi.
+"""LAYER 1a — OpenStreetMap / Overpass discovery.
 
-Tek sorumluluk: OSM ile konusmak ve donen ogeleri `Candidate`'a cevirmek.
-CSV yazmaz, baska API cagirmaz.
+Single responsibility: talking to OSM and converting the returned elements
+into `Candidate` objects. Writes no CSV and calls no other API.
 
-Not: bu modul website filtresi UYGULAMAZ. Filtreleme, OSM ve TomTom
-sonuclari birlestirildikten sonra yapilir (bkz. merge.py / pipeline.py);
-aksi halde bir kaynagin eksik verisi digerinin bilgisini golgelerdi.
+Note: this module does NOT apply the website filter. Filtering happens after
+the OSM and TomTom results are merged (see merge.py / pipeline.py); otherwise
+one source's missing data would mask what the other one knows.
 """
 
 from __future__ import annotations
@@ -23,11 +23,11 @@ from .text_utils import is_real_website, norm_text
 OVERPASS_BUCKET = "overpass"
 
 # ---------------------------------------------------------------------------
-# Is tipi -> OSM tag eslemesi (genisletilebilir)
-# Bir tip birden fazla tag'e karsilik gelebilir.
+# Business type -> OSM tag mapping (extensible).
+# A single type may map to several tags.
 # ---------------------------------------------------------------------------
 BUSINESS_TYPES: Dict[str, List[Tuple[str, str]]] = {
-    # yeme-icme
+    # food and drink
     "restaurant":      [("amenity", "restaurant")],
     "cafe":            [("amenity", "cafe")],
     "bar":             [("amenity", "bar"), ("amenity", "pub")],
@@ -37,26 +37,26 @@ BUSINESS_TYPES: Dict[str, List[Tuple[str, str]]] = {
     "butcher":         [("shop", "butcher")],
     "greengrocer":     [("shop", "greengrocer")],
     "supermarket":     [("shop", "supermarket"), ("shop", "convenience")],
-    # kisisel bakim
+    # personal care
     "hair_salon":      [("shop", "hairdresser")],
     "beauty_salon":    [("shop", "beauty")],
     "spa":             [("leisure", "spa"), ("shop", "massage")],
     "tattoo":          [("shop", "tattoo")],
-    # oto
+    # automotive
     "car_repair":      [("shop", "car_repair"), ("craft", "car_repair")],
     "car_dealer":      [("shop", "car")],
     "car_wash":        [("amenity", "car_wash")],
     "car_parts":       [("shop", "car_parts")],
     "tyres":           [("shop", "tyres")],
     "motorcycle":      [("shop", "motorcycle"), ("shop", "motorcycle_repair")],
-    # saglik
+    # health
     "dentist":         [("amenity", "dentist")],
     "doctor":          [("amenity", "doctors")],
     "pharmacy":        [("amenity", "pharmacy")],
     "veterinary":      [("amenity", "veterinary")],
     "physiotherapist": [("healthcare", "physiotherapist")],
     "optician":        [("shop", "optician")],
-    # profesyonel hizmet / ofis
+    # professional services / offices
     "lawyer":          [("office", "lawyer")],
     "accountant":      [("office", "accountant"), ("office", "tax_advisor")],
     "estate_agent":    [("office", "estate_agent")],
@@ -64,7 +64,7 @@ BUSINESS_TYPES: Dict[str, List[Tuple[str, str]]] = {
     "travel_agency":   [("shop", "travel_agency"), ("office", "travel_agent")],
     "architect":       [("office", "architect")],
     "advertising":     [("office", "advertising_agency")],
-    # zanaat / teknik
+    # trades / technical
     "plumber":         [("craft", "plumber")],
     "electrician":     [("craft", "electrician")],
     "carpenter":       [("craft", "carpenter")],
@@ -72,7 +72,7 @@ BUSINESS_TYPES: Dict[str, List[Tuple[str, str]]] = {
     "locksmith":       [("craft", "locksmith"), ("shop", "locksmith")],
     "hvac":            [("craft", "hvac")],
     "photographer":    [("craft", "photographer"), ("shop", "photo")],
-    # spor / egitim / diger
+    # sports / education / other
     "gym":             [("leisure", "fitness_centre")],
     "sports_centre":   [("leisure", "sports_centre")],
     "driving_school":  [("amenity", "driving_school")],
@@ -95,7 +95,12 @@ BUSINESS_TYPES: Dict[str, List[Tuple[str, str]]] = {
     "funeral":         [("shop", "funeral_directors")],
 }
 
-# Turkce (ve bazi ingilizce) takma adlar -> kanonik tip
+# Localized (and a few English) aliases -> canonical type.
+#
+# These stay in the source language on purpose. They are INPUT vocabulary, not
+# UI text: they let an operator type the word actually used for a trade
+# ("kuafor", "oto tamirci") instead of the OSM tag name. Translating them away
+# would remove a feature rather than internationalize one. Output is English.
 TYPE_ALIASES: Dict[str, str] = {
     "restoran": "restaurant", "lokanta": "restaurant", "yemek": "restaurant",
     "kafe": "cafe", "kahve": "cafe", "coffee": "cafe", "kahveci": "cafe",
@@ -141,7 +146,7 @@ TYPE_ALIASES: Dict[str, str] = {
     "cenaze": "funeral",
 }
 
-# OSM'de "web sitesi var" sayilan tag'ler
+# Tags that count as "this business has a website" in OSM.
 WEBSITE_TAGS = (
     "website", "contact:website", "url", "contact:url",
     "website:en", "website:tr", "official_website",
@@ -154,7 +159,7 @@ SOCIAL_TAGS = ("contact:instagram", "contact:facebook", "facebook", "instagram")
 
 
 class UnknownBusinessType(Exception):
-    """Kullanici tanimsiz bir is tipi verdi."""
+    """The user supplied a business type we do not recognize."""
 
     def __init__(self, unknown: Sequence[str]):
         self.unknown = list(unknown)
@@ -162,7 +167,7 @@ class UnknownBusinessType(Exception):
 
 
 def resolve_types(raw_types: Sequence[str]) -> List[str]:
-    """Kullanici girdisini kanonik tip adlarina cevirir ('restoran' -> 'restaurant')."""
+    """Map user input onto canonical type names ('restoran' -> 'restaurant')."""
     resolved: List[str] = []
     unknown: List[str] = []
     for raw in raw_types:
@@ -181,7 +186,7 @@ def resolve_types(raw_types: Sequence[str]) -> List[str]:
 
 def build_overpass_query(types: Sequence[str], lat: float, lon: float,
                          radius_m: int, timeout_s: int) -> str:
-    """Tek sorguda tum yaricapi kapsayan Overpass QL uretir (tiling gerekmez)."""
+    """Build Overpass QL covering the whole radius in one query (no tiling)."""
     lines = [f"[out:json][timeout:{timeout_s}];", "("]
     for btype in types:
         for key, value in BUSINESS_TYPES[btype]:
@@ -200,7 +205,7 @@ def _first_tag(tags: Dict[str, str], keys: Sequence[str]) -> str:
 
 
 def _build_address(tags: Dict[str, str]) -> str:
-    """OSM addr:* tag'lerinden okunabilir tek satirlik adres kurar."""
+    """Assemble a readable single-line address from the OSM addr:* tags."""
     street = _first_tag(tags, ("addr:street",))
     number = _first_tag(tags, ("addr:housenumber",))
     quarter = _first_tag(tags, ("addr:neighbourhood", "addr:suburb", "addr:quarter"))
@@ -211,7 +216,7 @@ def _build_address(tags: Dict[str, str]) -> str:
 
 
 def _classify_type(tags: Dict[str, str], wanted: Sequence[str]) -> Tuple[str, str]:
-    """Ogenin hangi is tipine dustugunu bulur -> (tip, 'anahtar=deger')."""
+    """Determine which business type an element falls under -> (type, 'key=value')."""
     for btype in wanted:
         for key, value in BUSINESS_TYPES[btype]:
             if tags.get(key) == value:
@@ -223,7 +228,7 @@ def _classify_type(tags: Dict[str, str], wanted: Sequence[str]) -> Tuple[str, st
 
 
 def _element_position(element: Dict) -> Tuple[Optional[float], Optional[float]]:
-    """node icin lat/lon, way/relation icin center."""
+    """lat/lon for a node, the computed center for a way or relation."""
     if element.get("type") == "node":
         return element.get("lat"), element.get("lon")
     center = element.get("center") or {}
@@ -232,7 +237,7 @@ def _element_position(element: Dict) -> Tuple[Optional[float], Optional[float]]:
 
 def _element_to_candidate(element: Dict, types: Sequence[str],
                           center: Center, radius_m: int) -> Optional[Candidate]:
-    """Tek bir Overpass ogesini Candidate'a cevirir; uygun degilse None."""
+    """Convert one Overpass element into a Candidate; None if unsuitable."""
     tags = element.get("tags") or {}
     lat, lon = _element_position(element)
     if lat is None or lon is None:
@@ -265,15 +270,15 @@ def _element_to_candidate(element: Dict, types: Sequence[str],
 
 
 def _richer(a: Candidate, b: Candidate) -> Candidate:
-    """Ayni isletmenin iki kopyasindan daha dolu olani secer."""
+    """Of two copies of the same business, keep the one with more data."""
     score = lambda c: sum(bool(x) for x in (c.phone, c.address, c.email, c.osm_website))
     return a if score(a) >= score(b) else b
 
 
 def _fetch_overpass(http: HttpClient, cfg: Config, query: str) -> Optional[Dict]:
-    """Mirror'lari sirayla dener; ilk basarili JSON yaniti doner."""
+    """Try each mirror in turn; return the first successful JSON response."""
     for mirror in cfg.overpass_mirrors:
-        log(f"Overpass mirror deneniyor: {mirror}")
+        log(f"Trying Overpass mirror: {mirror}")
         resp = http.request(
             "POST", mirror,
             bucket=OVERPASS_BUCKET, delay=cfg.delay_overpass,
@@ -284,23 +289,23 @@ def _fetch_overpass(http: HttpClient, cfg: Config, query: str) -> Optional[Dict]
         try:
             return resp.json()
         except ValueError:
-            log("Overpass yaniti JSON degil, sonraki mirror deneniyor.", level="warn")
+            log("Overpass response was not JSON, trying the next mirror.", level="warn")
     return None
 
 
 def search_osm(http: HttpClient, cfg: Config, types: Sequence[str], center: Center) -> List[Candidate]:
-    """Bolgedeki TUM isletmeleri dondurur (website filtresi uygulanmaz)."""
+    """Return ALL businesses in the area (no website filtering applied)."""
     query = build_overpass_query(types, center.lat, center.lon, cfg.radius_m, cfg.overpass_timeout)
-    log(f"KATMAN 1a — Overpass sorgusu ({len(types)} tip, {cfg.radius_m} m yaricap)")
-    log(f"Sorgu:\n{query}", level="dbg")
+    log(f"LAYER 1a — Overpass query ({len(types)} types, {cfg.radius_m} m radius)")
+    log(f"Query:\n{query}", level="dbg")
 
     data = _fetch_overpass(http, cfg, query)
     if data is None:
-        log("Tum Overpass mirror'lari basarisiz oldu.", level="err")
+        log("Every Overpass mirror failed.", level="err")
         return []
 
     elements = data.get("elements", [])
-    log(f"Overpass {len(elements)} ham oge dondurdu.", level="ok")
+    log(f"Overpass returned {len(elements)} raw elements.", level="ok")
 
     unique: Dict[str, Candidate] = {}
     skipped_unnamed = 0
@@ -319,7 +324,8 @@ def search_osm(http: HttpClient, cfg: Config, types: Sequence[str], center: Cent
 
     results = sorted(unique.values(), key=lambda c: c.distance_m)
     with_site = sum(1 for c in results if c.osm_website and is_real_website(c.osm_website))
-    log(f"KATMAN 1a (OSM) sonucu: {len(results)} isletme "
-        f"({with_site} tanesinin OSM'de website tag'i var), "
-        f"{skipped_unnamed} isimsiz atlandi, {skipped_far} yaricap disi atildi.", level="ok")
+    log(f"LAYER 1a (OSM) result: {len(results)} businesses "
+        f"({with_site} carry a website tag in OSM), "
+        f"{skipped_unnamed} unnamed skipped, {skipped_far} outside the radius.",
+        level="ok")
     return results

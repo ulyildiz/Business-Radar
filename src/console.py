@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Terminal cikti yardimcilari.
+"""Terminal output helpers.
 
-Tek sorumluluk: kullaniciya terminalde mesaj gostermek.
-Hicbir seyi disari yazmaz, hicbir API cagirmaz.
+Single responsibility: showing messages to the user in the terminal.
+Writes no files and calls no APIs.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ _PREFIX = {
 
 
 def enable_utf8() -> None:
-    """Windows konsolunda Turkce karakterler patlamasin."""
+    """Keep non-ASCII business names from crashing the Windows console."""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -40,7 +40,7 @@ def is_verbose() -> bool:
 
 
 def log(msg: str, *, level: str = "info") -> None:
-    """Tek satirlik durum mesaji. 'dbg' seviyesi sadece --verbose ile gorunur."""
+    """One-line status message. Level 'dbg' is only shown with --verbose."""
     if level == "dbg" and not _VERBOSE:
         return
     stream = sys.stderr if level in ("warn", "err", "dbg") else sys.stdout
@@ -49,7 +49,7 @@ def log(msg: str, *, level: str = "info") -> None:
 
 
 def wrap(text: str, width: int) -> List[str]:
-    """Metni verilen genislige gore satirlara boler (textwrap'e ince alternatif)."""
+    """Split text into lines of at most `width` characters (slim textwrap)."""
     lines: List[str] = []
     current = ""
     for word in text.split():

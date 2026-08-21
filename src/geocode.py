@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Nominatim: adres -> koordinat (ve ters yonde semt adi).
+"""Nominatim: address -> coordinates (and the reverse, for a locality name).
 
-Tek sorumluluk: geocoding. Nominatim politikasi geregi saniyede en fazla
-1 istek atilir (gecikme Config'ten gelir) ve User-Agent iletisim bilgisi icerir.
+Single responsibility: geocoding. Nominatim's usage policy allows at most one
+request per second (the delay comes from Config) and requires a descriptive
+User-Agent carrying contact information.
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ BUCKET = "nominatim"
 
 
 def geocode_address(http: HttpClient, cfg: Config, address: str) -> Optional[Center]:
-    """Adresi koordinata cevirir. Bulunamazsa None."""
-    log(f"Adres cozumleniyor (Nominatim): {address}")
+    """Resolve an address to coordinates. Returns None if it cannot be found."""
+    log(f"Resolving address (Nominatim): {address}")
     resp = http.request(
         "GET", NOMINATIM_SEARCH,
         bucket=BUCKET, delay=cfg.delay_nominatim,
@@ -33,10 +34,10 @@ def geocode_address(http: HttpClient, cfg: Config, address: str) -> Optional[Cen
     try:
         data = resp.json()
     except ValueError:
-        log("Nominatim yaniti JSON degil.", level="err")
+        log("Nominatim response was not JSON.", level="err")
         return None
     if not data:
-        log(f"Adres bulunamadi: {address}", level="err")
+        log(f"Address not found: {address}", level="err")
         return None
 
     item = data[0]
@@ -45,12 +46,12 @@ def geocode_address(http: HttpClient, cfg: Config, address: str) -> Optional[Cen
         lon=float(item["lon"]),
         label=item.get("display_name", address),
     )
-    log(f"Koordinat: {center.lat:.6f}, {center.lon:.6f}  ({center.label})", level="ok")
+    log(f"Coordinates: {center.lat:.6f}, {center.lon:.6f}  ({center.label})", level="ok")
     return center
 
 
 def reverse_city(http: HttpClient, cfg: Config, lat: float, lon: float) -> str:
-    """Koordinattan semt/ilce adi — Katman 3 sorgusuna eklenir."""
+    """Locality name for a coordinate — appended to the Layer 3 query."""
     resp = http.request(
         "GET", NOMINATIM_REVERSE,
         bucket=BUCKET, delay=cfg.delay_nominatim,
