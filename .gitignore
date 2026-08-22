@@ -19,4 +19,4 @@ venv/
 # Produced by the Makefile
 requirements.lock.txt
 .install-stamp
-.langsearch_quota_state.json
+.businessfind.lock

@@ -84,9 +84,9 @@ help:
 setup: install env
 	@echo -------------------------------------------------------------
 	@echo  Setup complete. Next, fill in the .env file:
-	@echo    CONTACT_EMAIL, TOMTOM_API_KEY, LANGSEARCH_API_KEY
+	@echo    CONTACT_EMAIL, TOMTOM_API_KEY
 	@echo  To try it without any API key:
-	@$(QUOTE_ECHO) make~run~ARGS= --address~Kadikoy~--skip-tomtom~--skip-langsearch~--contact~you@example.com
+	@$(QUOTE_ECHO) make~run~ARGS= --address~Kadikoy~--skip-tomtom~--contact~you@example.com
 	@echo -------------------------------------------------------------
 
 venv: $(VENV_PY)

@@ -12,26 +12,18 @@ import os
 from typing import Any, Dict, Sequence, Tuple
 
 from .console import log, wrap
-from .models import (
-    FOUND_VIA_LANGSEARCH,
-    FOUND_VIA_OSM,
-    FOUND_VIA_TOMTOM,
-    VERIFY_LANGSEARCH,
-    VERIFY_NOT_CHECKED,
-    Candidate,
-    RunResult,
-)
+from .models import FOUND_VIA_OSM, FOUND_VIA_TOMTOM, Candidate, RunResult
 
 # --- Schemas (FR-12 / FR-13) -------------------------------------------------
 NO_WEBSITE_FIELDS = [
-    "name", "type", "address", "phone", "distance_m", "sources", "verified", "osm_link",
+    "name", "type", "address", "phone", "distance_m", "sources", "osm_link",
 ]
 HAS_WEBSITE_FIELDS = [
     "name", "type", "address", "phone", "distance_m", "website", "found_via", "sources",
 ]
 # Diagnostic columns added by --full-columns (omitted by default).
 EXTRA_FIELDS = [
-    "tomtom_checked", "langsearch_checked", "langsearch_skipped", "email", "opening_hours",
+    "tomtom_checked", "email", "opening_hours",
     "lat", "lon", "osm_id", "osm_tag", "tomtom_id", "tomtom_category",
     "social", "notes",
 ]
@@ -64,13 +56,10 @@ def _row_of(candidate: Candidate) -> Dict[str, Any]:
         "phone": candidate.best_phone(),
         "distance_m": candidate.distance_m,
         "sources": "+".join(candidate.sources),
-        "verified": candidate.verification_state(),
         "osm_link": candidate.osm_link,
         "website": candidate.website,
         "found_via": candidate.found_via,
         "tomtom_checked": str(candidate.tomtom_checked).lower(),
-        "langsearch_checked": str(candidate.langsearch_checked).lower(),
-        "langsearch_skipped": str(candidate.langsearch_skipped).lower(),
         "email": candidate.email,
         "opening_hours": candidate.opening_hours,
         "lat": f"{candidate.lat:.6f}",
@@ -121,15 +110,9 @@ def write_notes(path: str, result: RunResult, no_website_path: str, has_website_
         fh.write("  osm         -> found only in OpenStreetMap\n")
         fh.write("  tomtom      -> found only in TomTom (no OSM record)\n")
         fh.write("  osm+tomtom  -> present in both sources (most reliable records)\n\n")
-        fh.write("The `verified` column shows whether the lead passed through Layer 3:\n")
-        fh.write(f"  {VERIFY_LANGSEARCH:15s} -> web search ran, no domain of its own was found\n")
-        fh.write(f"  {VERIFY_NOT_CHECKED:15s} -> not verified: the layer was disabled, the\n")
-        fh.write("                     daily quota ran out, or the request failed. The\n")
-        fh.write("                     record stays a lead, but with weaker evidence.\n\n")
         fh.write("The `found_via` column shows WHICH layer found the website:\n")
         fh.write(f"  {FOUND_VIA_OSM:15s} -> OSM website / contact:website tag\n")
         fh.write(f"  {FOUND_VIA_TOMTOM:15s} -> TomTom poi.url field\n")
-        fh.write(f"  {FOUND_VIA_LANGSEARCH:15s} -> LangSearch web search\n")
     log(f"Written: {path}", level="ok")
 
 
@@ -170,11 +153,6 @@ def _print_lead_quality(leads: Sequence[Candidate]) -> None:
     if only_tomtom:
         print(f"   -> {only_tomtom} leads found ONLY through TomTom (absent from OSM)")
 
-    verified = sum(1 for c in leads if c.langsearch_checked)
-    unverified = len(leads) - verified
-    print(f"Layer 3 verification   : {verified}/{len(leads)} leads verified"
-          + (f", {unverified} marked '{VERIFY_NOT_CHECKED}'" if unverified else ""))
-
     with_phone = sum(1 for c in leads if c.best_phone())
     with_address = sum(1 for c in leads if c.best_address())
     pct = (100 * with_phone / len(leads)) if leads else 0
@@ -198,7 +176,7 @@ def print_summary(result: RunResult, *, no_web_path: str, has_web_path: str,
     print(f"NO WEBSITE (leads)     : {len(leads)}   -> {no_web_path}")
     print(f"HAS WEBSITE            : {len(result.has_website)}   -> "
           f"{has_web_path if wrote_has_website else '(not written)'}")
-    for via in (FOUND_VIA_OSM, FOUND_VIA_TOMTOM, FOUND_VIA_LANGSEARCH):
+    for via in (FOUND_VIA_OSM, FOUND_VIA_TOMTOM):
         count = sum(1 for c in result.has_website if c.found_via == via)
         if count:
             print(f"   - {via:22s}: {count}")

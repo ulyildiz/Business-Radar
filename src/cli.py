@@ -16,15 +16,9 @@ from . import config as config_module
 from . import osm_source, output, tomtom_source
 from .config import (
     APP_NAME,
-    DELAY_LANGSEARCH,
     DELAY_TOMTOM,
     ENV_CONTACT,
-    ENV_LANGSEARCH,
     ENV_TOMTOM,
-    LANGSEARCH_FREE_QPD,
-    LANGSEARCH_FREE_QPM,
-    LANGSEARCH_PER_MINUTE,
-    LANGSEARCH_QUOTA_FILE,
     TOMTOM_DAILY_FREE_LIMIT,
     TOMTOM_DEFAULT_CELL_M,
     TOMTOM_DEFAULT_LANGUAGE,
@@ -35,11 +29,10 @@ from .config import (
 )
 from .console import enable_utf8, log, set_verbose
 from .geo_utils import build_grid
+from .filelock import FileLock, LockBusy, resolve_lock_path
 from .http_client import HttpClient
-from .langsearch_verify import estimate_seconds, human_duration
 from .osm_source import BUSINESS_TYPES, TYPE_ALIASES, UnknownBusinessType, resolve_types
 from .pipeline import resolve_center, run_and_report
-from .quota import DailyQuota, default_quota_path
 
 PROG = "python -m src.cli"
 
@@ -80,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
         description="Finds local businesses with and without websites within a "
-                    "GPS radius (3 layers, free APIs only).",
+                    "GPS radius, using free APIs only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "First-time setup:\n"
@@ -123,7 +116,6 @@ def _add_key_arguments(parser: argparse.ArgumentParser) -> None:
     keys.add_argument("--contact",
                       help=f".env: {ENV_CONTACT} — contact details placed in the User-Agent")
     keys.add_argument("--tomtom-key", help=f".env: {ENV_TOMTOM}")
-    keys.add_argument("--langsearch-key", help=f".env: {ENV_LANGSEARCH}")
     keys.add_argument("--env-file", help="Alternative path to the .env file")
 
 
@@ -132,8 +124,6 @@ def _add_layer_arguments(parser: argparse.ArgumentParser) -> None:
     layers = parser.add_argument_group("layers")
     layers.add_argument("--skip-tomtom", action="store_true",
                         help="Skip the TomTom layer entirely")
-    layers.add_argument("--skip-langsearch", action="store_true",
-                        help="Skip the LangSearch layer")
     layers.add_argument("--tomtom-mode", choices=("discover", "verify"), default="discover",
                         help="discover: TomTom sweeps the area independently and ADDS "
                              "businesses missing from OSM (default). "
@@ -156,21 +146,6 @@ def _add_layer_arguments(parser: argparse.ArgumentParser) -> None:
     layers.add_argument("--tomtom-language", default=TOMTOM_DEFAULT_LANGUAGE,
                         help=f"Locale of the business data TomTom returns, not the UI "
                              f"language (default: {TOMTOM_DEFAULT_LANGUAGE})")
-    layers.add_argument("--langsearch-count", type=int, default=10,
-                        help="Number of LangSearch results per query (default: 10)")
-    layers.add_argument("--langsearch-city",
-                        help="Locality appended to the Layer 3 query (default: automatic)")
-    layers.add_argument("--langsearch-daily-limit", type=int, default=LANGSEARCH_FREE_QPD,
-                        help=f"LangSearch daily request ceiling (free tier QPD="
-                             f"{LANGSEARCH_FREE_QPD}). 0 disables tracking.")
-    layers.add_argument("--langsearch-per-minute", type=int, default=LANGSEARCH_PER_MINUTE,
-                        help=f"LangSearch per-minute ceiling (free tier QPM="
-                             f"{LANGSEARCH_FREE_QPM}; the default of "
-                             f"{LANGSEARCH_PER_MINUTE} leaves margin). Lower this if "
-                             f"429s persist.")
-    layers.add_argument("--langsearch-quota-file", default=LANGSEARCH_QUOTA_FILE,
-                        help=f"State file holding the daily counter "
-                             f"(default: {LANGSEARCH_QUOTA_FILE})")
 
 
 def _add_tuning_arguments(parser: argparse.ArgumentParser) -> None:
@@ -203,14 +178,15 @@ def _add_network_arguments(parser: argparse.ArgumentParser) -> None:
                      help="Custom Overpass mirror (repeatable)")
     net.add_argument("--delay-tomtom", type=float, default=DELAY_TOMTOM,
                      help=f"Delay between TomTom requests (default: {DELAY_TOMTOM})")
-    net.add_argument("--langsearch-delay", "--delay-langsearch", type=float,
-                     dest="langsearch_delay", default=DELAY_LANGSEARCH,
-                     help=f"PROACTIVE delay between LangSearch requests, seconds "
-                          f"(default: {DELAY_LANGSEARCH}). The free tier allows QPS=1, "
-                          f"so going below this produces 429s; 0.25 is enough on "
-                          f"Tier 1 (QPS=5).")
+
+
     net.add_argument("--max-retries", type=int, default=3,
                      help="Retry attempts for failed requests (default: 3)")
+    net.add_argument("--no-run-lock", action="store_true",
+                     help="Allow a second run to start while one is in progress. "
+                          "Only safe with a DIFFERENT API key — concurrent runs "
+                          "on the same key multiply the request rate the server "
+                          "sees and cause sustained 429s.")
 
 
 def _add_helper_mode_arguments(parser: argparse.ArgumentParser) -> None:
@@ -241,12 +217,10 @@ def build_config(args: argparse.Namespace) -> Config:
     return Config(
         contact=resolve(args.contact, env, ENV_CONTACT),
         tomtom_key=resolve(args.tomtom_key, env, ENV_TOMTOM),
-        langsearch_key=resolve(args.langsearch_key, env, ENV_LANGSEARCH),
         env_path=env_path,
         radius_m=args.radius,
         include_unnamed=args.include_unnamed,
         skip_tomtom=args.skip_tomtom,
-        skip_langsearch=args.skip_langsearch,
         tomtom_mode=args.tomtom_mode,
         overpass_mirrors=args.overpass_url or list(config_module.DEFAULT_OVERPASS_MIRRORS),
         overpass_timeout=args.overpass_timeout,
@@ -257,16 +231,11 @@ def build_config(args: argparse.Namespace) -> Config:
         tomtom_match_radius_m=args.tomtom_match_radius,
         tomtom_categories=parse_category_overrides(args.tomtom_category),
         tomtom_language=args.tomtom_language,
-        langsearch_count=args.langsearch_count,
-        langsearch_city=args.langsearch_city,
         merge_distance_m=args.merge_distance,
         name_threshold=args.name_threshold,
         min_token_len=args.min_token_len,
         delay_tomtom=args.delay_tomtom,
-        delay_langsearch=args.langsearch_delay,
-        langsearch_daily_limit=args.langsearch_daily_limit,
-        langsearch_per_minute=args.langsearch_per_minute,
-        langsearch_quota_file=args.langsearch_quota_file,
+        use_run_lock=not args.no_run_lock,
         max_retries=args.max_retries,
         output_base=args.output,
         write_has_website=not args.no_has_website,
@@ -313,15 +282,12 @@ def print_dry_run(cfg: Config, args: argparse.Namespace, types: Sequence[str]) -
 
     print("\nEstimated request counts:")
     print(f"  Nominatim (geocode)   : {0 if has_center else 1}")
-    print(f"  Nominatim (reverse)   : {0 if (cfg.skip_langsearch or cfg.langsearch_city) else 1}")
     print(f"  Overpass              : 1  (one query covers the whole radius)")
     _print_tomtom_estimate(cfg, types, lat, lon)
-    _print_langsearch_estimate(cfg)
 
     print("\nLayer status:")
     print(f"  Layer 1a (OSM)        : ACTIVE")
     print(f"  Layer 1b/2 (TomTom)   : {_layer_state(cfg.skip_tomtom, cfg.tomtom_key, cfg.tomtom_mode)}")
-    print(f"  Layer 3 (LangSearch)  : {_layer_state(cfg.skip_langsearch, cfg.langsearch_key)}")
 
     no_web, has_web, notes = output.output_paths(cfg.output_base)
     print(f"\nOutput (leads): {no_web}")
@@ -362,21 +328,6 @@ def _print_tomtom_estimate(cfg: Config, types: Sequence[str], lat: float, lon: f
         print(f"         or use --tomtom-mode verify.")
 
 
-def _print_langsearch_estimate(cfg: Config) -> None:
-    """How many requests and HOW LONG Layer 3 costs — shown before spending (FR-30)."""
-    if cfg.skip_langsearch:
-        print(f"  LangSearch (Layer 3)  : skipped")
-        return
-    quota = DailyQuota(cfg.langsearch_daily_limit,
-                       default_quota_path(cfg.langsearch_quota_file), label="LangSearch")
-    qpm = cfg.langsearch_per_minute
-    print(f"  LangSearch (Layer 3)  : one per candidate passing the website filter")
-    print(f"      {cfg.delay_langsearch:.2f}s between requests, per-minute cap {qpm} -> "
-          f"100 candidates ~{human_duration(estimate_seconds(100, cfg.delay_langsearch, qpm))}, "
-          f"500 ~{human_duration(estimate_seconds(500, cfg.delay_langsearch, qpm))}")
-    print(f"      daily quota: {quota.status()}")
-
-
 def _print_missing_key_warnings(cfg: Config) -> None:
     """A dry run issues no requests, so it warns instead of stopping."""
     missing = []
@@ -384,8 +335,6 @@ def _print_missing_key_warnings(cfg: Config) -> None:
         missing.append(ENV_CONTACT)
     if not cfg.skip_tomtom and not cfg.tomtom_key:
         missing.append(ENV_TOMTOM)
-    if not cfg.skip_langsearch and not cfg.langsearch_key:
-        missing.append(ENV_LANGSEARCH)
     if missing:
         print()
         print("WARNING: these settings are missing -> " + ", ".join(missing))
@@ -448,7 +397,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.tomtom_probe:
         return run_probe(cfg, args, types)
 
-    return run_and_report(cfg, types, address=args.address, latlng=args.latlng)
+    return _locked_run(cfg, args, types)
+
+
+def _locked_run(cfg: Config, args: argparse.Namespace, types: Sequence[str]) -> int:
+    """Run the scan while holding the single-run lock.
+
+    Serializing runs is not a convenience: rate limits are scoped to the API
+    key, so a second concurrent run doubles the load the server sees no matter
+    how carefully each process throttles itself.
+    """
+    if not cfg.use_run_lock:
+        log("Run lock disabled (--no-run-lock). Only do this with a different "
+            "API key.", level="warn")
+        return run_and_report(cfg, types, address=args.address, latlng=args.latlng)
+
+    lock = FileLock(resolve_lock_path(cfg.run_lock_file),
+                    timeout=0.0, label=APP_NAME)
+    try:
+        lock.acquire()
+    except LockBusy as exc:
+        sys.stderr.write(
+            f"\n[x] Another {APP_NAME} run is already using this API key.\n"
+            f"    {exc}\n\n"
+            f"    Concurrent runs share the server-side rate limit and cause\n"
+            f"    sustained 429s, so this run was refused rather than started.\n"
+            f"    Wait for the other run to finish, or pass --no-run-lock if\n"
+            f"    you are using a different key.\n\n")
+        return 3
+    try:
+        return run_and_report(cfg, types, address=args.address, latlng=args.latlng)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

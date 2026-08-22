@@ -12,7 +12,7 @@ import random
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -22,9 +22,6 @@ from .console import log
 MAX_BACKOFF_S = 60.0
 RETRYABLE = (429, 502, 503, 504)
 AUTH_FAILURE = (401, 403)
-
-# Length of the rolling per-minute (QPM) window.
-WINDOW_S = 60.0
 
 # On a 429 the bucket's base delay grows by this much, and creeps back down
 # after this many successful requests. A fixed delay alone is not enough: the
@@ -73,7 +70,6 @@ class HttpClient:
         self.max_retries = cfg.max_retries
         self.timeout = cfg.timeout_s
         self._last_call: Dict[str, float] = {}
-        self._window: Dict[str, List[float]] = {}
         self._extra_delay: Dict[str, float] = {}
         self._ok_streak: Dict[str, int] = {}
         self.counts: Dict[str, int] = {}
@@ -83,25 +79,17 @@ class HttpClient:
 
     # -----------------------------------------------------------------------
 
-    def _throttle(self, bucket: str, delay: float, per_minute: int) -> None:
-        """Wait BEFORE sending. Two separate limits are enforced together.
+    def _throttle(self, bucket: str, delay: float) -> None:
+        """Wait BEFORE sending, so the rate limit is never reached in anger.
 
-        1) Minimum interval between requests (QPS).
-        2) Total requests within the trailing 60 seconds (QPM).
-
-        The second is essential: looking only at the interval cannot see the
-        extra requests produced by retries. A 1.1s interval means one request
-        per second, but it also means ~55 requests per minute; add a few
-        retries and the per-minute ceiling is silently exceeded, at which point
-        429s start to cluster.
+        Reacting to a 429 is already too late: the request has been spent and
+        the server has recorded it. The delay is therefore applied ahead of
+        every send, retries included.
         """
-        wait = max(self._spacing_wait(bucket, delay), self._window_wait(bucket, per_minute))
+        wait = self._spacing_wait(bucket, delay)
         if wait > 0:
             time.sleep(wait)
-        now = time.monotonic()
-        self._last_call[bucket] = now
-        if per_minute > 0:
-            self._window.setdefault(bucket, []).append(now)
+        self._last_call[bucket] = time.monotonic()
 
     def _spacing_wait(self, bucket: str, delay: float) -> float:
         last = self._last_call.get(bucket)
@@ -110,19 +98,13 @@ class HttpClient:
         target = delay + self._extra_delay.get(bucket, 0.0)
         return target - (time.monotonic() - last)
 
-    def _window_wait(self, bucket: str, per_minute: int) -> float:
-        """If the rolling 60s window is full, wait until a slot frees up."""
-        if per_minute <= 0:
-            return 0.0
-        now = time.monotonic()
-        stamps = self._window.setdefault(bucket, [])
-        stamps[:] = [t for t in stamps if now - t < WINDOW_S]
-        if len(stamps) < per_minute:
-            return 0.0
-        return WINDOW_S - (now - stamps[0]) + 0.05
-
     def _slow_down(self, bucket: str) -> None:
-        """After a 429, slow this bucket down persistently — not just this call."""
+        """After a 429, slow this bucket down persistently — not just this call.
+
+        The real limit lives on the server and shifts over time, so the only
+        correct response is to adapt to the measured behaviour rather than
+        trust a configured constant.
+        """
         current = self._extra_delay.get(bucket, 0.0)
         updated = min(current + RATE_LIMIT_PENALTY_S, MAX_EXTRA_DELAY_S)
         self._extra_delay[bucket] = updated
@@ -166,13 +148,12 @@ class HttpClient:
         *,
         bucket: str,
         delay: float,
-        per_minute: int = 0,
         timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> Optional[requests.Response]:
         """Return the successful response, or None if every attempt failed."""
         for attempt in range(1, self.max_retries + 1):
-            self._throttle(bucket, delay, per_minute)
+            self._throttle(bucket, delay)
             self.counts[bucket] = self.counts.get(bucket, 0) + 1
 
             try:

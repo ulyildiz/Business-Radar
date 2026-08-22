@@ -5,7 +5,7 @@ This file must stay THIN: no business logic lives here, only in the modules it
 calls. Reading it top to bottom should give you a summary of the algorithm.
 
     geocode -> OSM discovery -> TomTom discovery -> merge -> website split
-            -> LangSearch verification -> write outputs
+            -> write outputs
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import List, Optional, Sequence, Tuple
 
-from . import geocode, langsearch_verify, merge, osm_source, output, tomtom_source
+from . import geocode, merge, osm_source, output, tomtom_source
 from .config import Config
 from .console import log
 from .http_client import Budget, HttpClient
@@ -45,20 +45,6 @@ def _verify_tomtom(http: HttpClient, cfg: Config, candidates: List[Candidate],
     if not (cfg.tomtom_enabled and cfg.tomtom_mode == "verify") or not candidates:
         return candidates
     return tomtom_source.verify_with_tomtom(http, cfg, candidates, budget)
-
-
-def _verify_langsearch(http: HttpClient, cfg: Config, center: Center,
-                       candidates: List[Candidate]) -> Tuple[List[Candidate], List[Candidate]]:
-    """Final cross-check -> (still without a site, ones found to have a site)."""
-    if not cfg.langsearch_enabled or not candidates:
-        if not cfg.langsearch_enabled:
-            log("LAYER 3 skipped (LangSearch disabled or no API key).")
-        return candidates, []
-    city = cfg.langsearch_city
-    if city is None:
-        city = geocode.reverse_city(http, cfg, center.lat, center.lon)
-        log(f'Layer 3 location hint: "{city}"', level="dbg")
-    return langsearch_verify.verify_with_langsearch(http, cfg, candidates, city or "")
 
 
 def _mark_all_tomtom_checked(records: Sequence[Candidate]) -> None:
@@ -96,10 +82,6 @@ def run(cfg: Config, types: Sequence[str], *, address: Optional[str] = None,
 
     # --- Website split (the single decision point) ---
     no_website, has_website = merge.split_by_website(merged)
-
-    # --- LAYER 3: final cross-check ---
-    no_website, found_by_langsearch = _verify_langsearch(http, cfg, center, no_website)
-    has_website.extend(found_by_langsearch)
 
     return RunResult(
         center=center,

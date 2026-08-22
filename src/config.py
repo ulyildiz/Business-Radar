@@ -19,7 +19,6 @@ VERSION = "2.1.0"
 # Variable names expected in .env (must match .env.example exactly).
 ENV_CONTACT = "CONTACT_EMAIL"
 ENV_TOMTOM = "TOMTOM_API_KEY"
-ENV_LANGSEARCH = "LANGSEARCH_API_KEY"
 
 USER_AGENT_TMPL = APP_NAME + "/{ver} (local business lead finder; contact: {contact})"
 
@@ -34,29 +33,12 @@ DELAY_NOMINATIM = 1.1   # Nominatim policy: at most 1 request per second
 DELAY_OVERPASS = 2.0
 DELAY_TOMTOM = 0.25     # freemium, roughly 5 QPS
 
-# LangSearch free tier: QPS=1, QPM=60, QPD=1000.
-# 1.0 sits exactly on the boundary; any clock skew or latency jitter trips the
-# limit immediately. 1.1 leaves a small but decisive margin. On a paid tier
-# (Tier 1: QPS=5) this can be lowered with --langsearch-delay 0.25.
-DELAY_LANGSEARCH = 1.1
-LANGSEARCH_FREE_QPD = 1000
-
-# THIS IS THE ACTUAL BINDING LIMIT.
-# A 1.1s interval satisfies QPS=1 but works out to ~55 requests per minute;
-# once retries are added it pins against the QPM=60 ceiling and 429s cluster.
-# Measured behaviour: 28 requests / 29s = 58 per minute -> at the ceiling.
-# We use 55 rather than 60 because the server's minute window does not start
-# at the same instant as ours; running exactly at the ceiling means constantly
-# scraping against it.
-LANGSEARCH_FREE_QPM = 60
-LANGSEARCH_PER_MINUTE = 55
-
-LANGSEARCH_QUOTA_FILE = ".langsearch_quota_state.json"
-# Layer 3 stops after this many consecutive CANDIDATE failures (FR-29).
-# A 429 is no longer treated as a permanent fault: adaptive slowdown is in
-# place, so the layer recovers on its own. Hence the high threshold — stopping
-# early used to cut a healthy scan short and leave leads as 'not_checked'.
-LANGSEARCH_MAX_CONSECUTIVE_FAILURES = 10
+# Only one run at a time may use a given API key. Two concurrent runs each
+# throttle themselves correctly and still double the load the server sees,
+# because rate limits and daily quotas are scoped to the key, not to the
+# process. Measured: two runs started in the same second produced sustained
+# 429s from the very first request while each reported zero usage of its own.
+RUN_LOCK_FILE = ".businessfind.lock"
 
 TOMTOM_DAILY_FREE_LIMIT = 2500
 TOMTOM_MAX_LIMIT = 100          # maximum results per call (API limit)
@@ -140,7 +122,6 @@ class Config:
     # --- identity / keys ---
     contact: str = ""
     tomtom_key: str = ""
-    langsearch_key: str = ""
     env_path: Optional[str] = None
 
     # --- search area ---
@@ -149,7 +130,6 @@ class Config:
 
     # --- layer switches ---
     skip_tomtom: bool = False
-    skip_langsearch: bool = False
     tomtom_mode: str = "discover"
 
     # --- Overpass ---
@@ -168,12 +148,9 @@ class Config:
     # way they are actually written on the shopfront.
     tomtom_language: str = TOMTOM_DEFAULT_LANGUAGE
 
-    # --- LangSearch ---
-    langsearch_count: int = 10
-    langsearch_city: Optional[str] = None
-    langsearch_daily_limit: int = LANGSEARCH_FREE_QPD
-    langsearch_per_minute: int = LANGSEARCH_PER_MINUTE
-    langsearch_quota_file: str = LANGSEARCH_QUOTA_FILE
+    # --- concurrency ---
+    run_lock_file: str = RUN_LOCK_FILE
+    use_run_lock: bool = True
 
     # --- matching ---
     merge_distance_m: float = 75.0
@@ -184,7 +161,6 @@ class Config:
     delay_nominatim: float = DELAY_NOMINATIM
     delay_overpass: float = DELAY_OVERPASS
     delay_tomtom: float = DELAY_TOMTOM
-    delay_langsearch: float = DELAY_LANGSEARCH
     max_retries: int = 3
     timeout_s: int = 60
 
@@ -201,10 +177,6 @@ class Config:
     def tomtom_enabled(self) -> bool:
         return bool(self.tomtom_key) and not self.skip_tomtom
 
-    @property
-    def langsearch_enabled(self) -> bool:
-        return bool(self.langsearch_key) and not self.skip_langsearch
-
     # -----------------------------------------------------------------------
 
     def require_keys(self) -> None:
@@ -218,8 +190,6 @@ class Config:
             missing.append(ENV_CONTACT)
         if not self.skip_tomtom and not self.tomtom_key:
             missing.append(ENV_TOMTOM)
-        if not self.skip_langsearch and not self.langsearch_key:
-            missing.append(ENV_LANGSEARCH)
         if not missing:
             return
 
@@ -250,11 +220,9 @@ def _missing_keys_message(missing: Sequence[str], env_path: Optional[str]) -> st
         lines.append("policies require a descriptive User-Agent with contact details.")
     if ENV_TOMTOM in missing:
         lines.append("To run without the TomTom layer: --skip-tomtom")
-    if ENV_LANGSEARCH in missing:
-        lines.append("To run without the LangSearch layer: --skip-langsearch")
     lines.append("")
     lines.append("Keys can also be passed on the command line: "
-                 "--tomtom-key / --langsearch-key / --contact")
+                 "--tomtom-key / --contact")
     return "\n".join(lines)
 
 

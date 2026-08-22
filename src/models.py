@@ -2,7 +2,7 @@
 """Data types carried through the pipeline.
 
 Single responsibility: the record schema. Every layer (osm_source,
-tomtom_source, merge, langsearch_verify, output) enriches and passes on the
+tomtom_source, merge, output) enriches and passes on the
 same `Candidate` object.
 """
 
@@ -20,15 +20,6 @@ SOURCE_TOMTOM = "tomtom"
 # --- Which layer found the website (has_website.csv -> found_via) ---
 FOUND_VIA_OSM = "osm_tag"
 FOUND_VIA_TOMTOM = "tomtom_poi_url"
-FOUND_VIA_LANGSEARCH = "langsearch"
-
-# --- Whether the lead was verified (no_website.csv -> verified) ---
-# "langsearch"  -> searched the web, found NO domain of its own (strong lead)
-# "not_checked" -> could not verify: layer disabled, quota exhausted, or the
-#                  request failed. The record stays a lead, but with weaker
-#                  evidence behind it.
-VERIFY_LANGSEARCH = FOUND_VIA_LANGSEARCH
-VERIFY_NOT_CHECKED = "not_checked"
 
 
 @dataclass
@@ -60,8 +51,6 @@ class Candidate:
     # --- audit trail ---
     sources: List[str] = field(default_factory=list)
     tomtom_checked: bool = False
-    langsearch_checked: bool = False
-    langsearch_skipped: bool = False
     website: str = ""
     found_via: str = ""
     notes: str = ""
@@ -88,15 +77,6 @@ class Candidate:
         self.found_via = found_via
         if note:
             self.add_note(note)
-
-    def verification_state(self) -> str:
-        """Did this lead pass through Layer 3? (no_website.csv -> verified)"""
-        return VERIFY_LANGSEARCH if self.langsearch_checked else VERIFY_NOT_CHECKED
-
-    def mark_unverified(self, reason: str) -> None:
-        """Verification was not possible — recorded rather than passed over."""
-        self.langsearch_skipped = True
-        self.add_note(f"LangSearch verification skipped ({reason})")
 
     def best_phone(self) -> str:
         return self.phone or self.tomtom_phone
